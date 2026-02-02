@@ -54,7 +54,7 @@ if [[ -z "$INPUT_ADMIN_ID" ]]; then
 fi
 
 # 2. 准备工作目录与代码
-REPO_URL="https://github.com/2019xuanying/tg-bot.git"
+REPO_URL="https://github.com/2019xuanying/tgbot.git"
 CURRENT_DIR=$(pwd)
 
 echo -e "${YELLOW}[2/6] 同步程序文件...${PLAIN}"
