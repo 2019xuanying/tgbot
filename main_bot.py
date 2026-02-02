@@ -5,6 +5,8 @@ import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 
 # 导入工具
 from utils.database import user_manager, ADMIN_ID
@@ -12,8 +14,8 @@ from utils.database import user_manager, ADMIN_ID
 # 导入插件
 from plugins import yanci
 from plugins import flexiroam
-from plugins import jetfi  # <--- 新增导入
-from plugins import travelgoogoo  # <--- 新增
+from plugins import jetfi
+from plugins import travelgoogoo
 
 # 配置日志
 logging.basicConfig(
@@ -29,297 +31,272 @@ if not BOT_TOKEN:
     print("❌ 错误：未找到 TG_BOT_TOKEN")
     sys.exit(1)
 
-# 定义状态
+# 定义管理状态
 ADMIN_STATE_NONE = 0
 ADMIN_WAIT_PROXY_LIST = 101
+ADMIN_WAIT_BROADCAST_MSG = 102
+ADMIN_WAIT_CHANNEL_SET = 103
+ADMIN_WAIT_BAN_ID = 104
+FEEDBACK_STATE = 200
 
-# ================= 主菜单逻辑 =================
+# ================= 辅助函数 =================
+
+async def check_channel_join(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """检查用户是否加入了指定频道"""
+    channel = user_manager.get_config("required_channel")
+    if not channel or str(user_id) == str(ADMIN_ID):
+        return True, ""
+    
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+        if member.status in ['left', 'kicked']:
+            return False, channel
+        return True, ""
+    except BadRequest:
+        # 机器人不在频道里，或者频道不存在，默认跳过
+        return True, ""
+    except Exception as e:
+        logger.error(f"Channel check error: {e}")
+        return True, ""
+
+def get_main_keyboard(is_admin):
+    kb = [
+        [InlineKeyboardButton("📅 每日签到", callback_data="user_daily_checkin"),
+         InlineKeyboardButton("👤 个人中心", callback_data="user_profile")],
+        [InlineKeyboardButton("🌏 Yanci", callback_data="plugin_yanci_entry"),
+         InlineKeyboardButton("🌐 Flexiroam", callback_data="plugin_flexi_entry")],
+        [InlineKeyboardButton("🚙 JetFi", callback_data="plugin_jetfi_entry"),
+         InlineKeyboardButton("🏝 TravelGoo", callback_data="plugin_travel_entry")],
+        [InlineKeyboardButton("🐛 问题反馈", callback_data="user_feedback")]
+    ]
+    if is_admin:
+        kb.append([InlineKeyboardButton("👮 管理员后台", callback_data="admin_menu_main")])
+    return InlineKeyboardMarkup(kb)
+
+# ================= 核心命令 =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    context.user_data['admin_state'] = ADMIN_STATE_NONE # 重置管理状态
+    args = context.args
+    
+    # 1. 更新数据库信息
+    user_manager.update_user_info(user.id, user.full_name, user.username)
+    
+    # 2. 封禁检查
+    if user_manager.is_banned(user.id):
+        await update.message.reply_text("🚫 您的账号已被封禁。")
+        return
 
-    is_auth = user_manager.is_authorized(user.id)
-    is_admin = (str(user.id) == str(ADMIN_ID))
+    # 3. 处理邀请
+    if args and len(args) > 0:
+        inviter_id = args[0]
+        if not user.username:
+            await update.message.reply_text("⚠️ **提示**：您需要设置 Telegram 用户名 (Username) 才能接受邀请奖励。", parse_mode=ParseMode.MARKDOWN)
+        else:
+            if user_manager.set_inviter(user.id, inviter_id):
+                reward = user_manager.get_config("invite_reward")
+                try:
+                    await context.bot.send_message(chat_id=inviter_id, text=f"🎉 新用户 {user.full_name} 加入！\n💰 获得积分: +{reward}")
+                except: pass
 
-    # 动态检查插件状态
-    yanci_status = user_manager.get_plugin_status("yanci")
-    flexi_status = user_manager.get_plugin_status("flexiroam")
-    jetfi_status = user_manager.get_plugin_status("jetfi") # <--- 新增状态检查
+    # 4. 强制关注检查
+    is_joined, channel_name = await check_channel_join(user.id, context)
+    if not is_joined:
+        clean_name = channel_name.replace('@', '')
+        kb = [[InlineKeyboardButton("👉 加入频道", url=f"https://t.me/{clean_name}")],
+              [InlineKeyboardButton("✅ 我已加入", callback_data="main_menu_root")]]
+        await update.message.reply_text(f"🛑 **需关注频道才能使用**\n请先加入: {channel_name}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        return
 
     text = (
-        f"🤖 **聚合控制中心**\n\n"
-        f"你好，{user.first_name}！\n"
-        f"ID: `{user.id}`\n"
-        f"状态: {'✅ 已获授权' if is_auth else '🚫 未获授权'}\n\n"
+        f"👋 **你好，{user.first_name}！**\n\n"
+        f"💰 积分: `{user_manager.get_points(user.id)}`\n"
+        f"🆔 ID: `{user.id}`\n\n"
+        f"请选择功能："
     )
+    await update.message.reply_text(text, reply_markup=get_main_keyboard(str(user.id) == str(ADMIN_ID)), parse_mode=ParseMode.MARKDOWN)
 
-    keyboard = []
+# ================= 用户回调 =================
 
-    if is_auth:
-        text += "请选择要运行的功能模块："
-        
-        yanci_btn_text = "🌏 Yanci 抢单助手" if yanci_status else "🌏 Yanci (维护中)"
-        flexi_btn_text = "🌐 Flexiroam 助手" if flexi_status else "🌐 Flexiroam (维护中)"
-        jetfi_btn_text = "🚙 JetFi 助手" if jetfi_status else "🚙 JetFi (维护中)" # <--- 新增按钮文本
-        
-        keyboard.append([InlineKeyboardButton(yanci_btn_text, callback_data="plugin_yanci_entry")])
-        keyboard.append([InlineKeyboardButton(flexi_btn_text, callback_data="plugin_flexi_entry")])
-        keyboard.append([InlineKeyboardButton(jetfi_btn_text, callback_data="plugin_jetfi_entry")]) # <--- 新增按钮
-        keyboard.append([InlineKeyboardButton("🏝 TravelGooGoo 扫码", callback_data="plugin_travel_entry")])
-    else:
-        text += "您目前没有使用权限，请点击下方按钮申请。"
-        keyboard.append([InlineKeyboardButton("📝 申请使用权限", callback_data="global_request_auth")])
-
-    if is_admin:
-         keyboard.append([InlineKeyboardButton("👮 管理员后台", callback_data="admin_menu_main")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-# ================= 全局回调处理 =================
-
-async def main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
-    await query.answer()
-    
     data = query.data
-    
+    await query.answer()
+
+    if user_manager.is_banned(user.id):
+        await query.edit_message_text("🚫 账号已封禁。")
+        return
+
     if data == "main_menu_root":
-        await start(update, context)
+        text = f"👋 **你好，{user.first_name}！**\n\n💰 积分: `{user_manager.get_points(user.id)}`\n🆔 ID: `{user.id}`"
+        await query.edit_message_text(text, reply_markup=get_main_keyboard(str(user.id) == str(ADMIN_ID)), parse_mode=ParseMode.MARKDOWN)
         return
 
-    # === 权限申请逻辑 (保持不变) ===
-    if data == "global_request_auth":
-        if not ADMIN_ID:
-            await query.edit_message_text("❌ 未配置管理员 ID。")
-            return
-        if user_manager.is_authorized(user.id):
-            await query.edit_message_text("✅ 您已有权限。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]]))
-            return
-        admin_text = f"📩 **权限申请**\n👤 {user.full_name}\n🆔 `{user.id}`\n🔗 @{user.username}"
-        admin_kb = [[InlineKeyboardButton("✅ 通过", callback_data=f"global_agree_{user.id}"), InlineKeyboardButton("❌ 拒绝", callback_data=f"global_deny_{user.id}")]]
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=InlineKeyboardMarkup(admin_kb), parse_mode='Markdown')
-            await query.edit_message_text("✅ 申请已发送，等待审核。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]]))
-        except Exception as e:
-            await query.edit_message_text("❌ 发送失败。")
+    if data == "user_daily_checkin":
+        success, reward = user_manager.check_in(user.id)
+        if success:
+            text = f"✅ **签到成功！**\n积分 +{reward}\n当前余额: {user_manager.get_points(user.id)}"
+        else:
+            text = f"⚠️ **今天已签到**\n明天再来吧！"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]]), parse_mode=ParseMode.MARKDOWN)
         return
 
-    # === 管理员审批逻辑 (保持不变) ===
-    if data.startswith("global_agree_"):
-        if str(user.id) != str(ADMIN_ID): return
-        target_uid = data.split("_")[-1]
-        user_manager.authorize_user(target_uid, username=f"User_{target_uid}")
-        await query.edit_message_text(f"✅ 已授权 `{target_uid}`", parse_mode='Markdown')
-        try: await context.bot.send_message(chat_id=target_uid, text="🎉 权限申请已通过！/start 刷新。")
-        except: pass
-        return
-
-    if data.startswith("global_deny_"):
-        if str(user.id) != str(ADMIN_ID): return
-        target_uid = data.split("_")[-1]
-        await query.edit_message_text(f"❌ 已拒绝 `{target_uid}`", parse_mode='Markdown')
-        try: await context.bot.send_message(chat_id=target_uid, text="⚠️ 权限申请被拒绝。")
-        except: pass
-        return
-
-    # ================= 管理员后台逻辑 =================
-    
-    # 1. 管理员主菜单
-    if data == "admin_menu_main":
-        if str(user.id) != str(ADMIN_ID): return
-        context.user_data['admin_state'] = ADMIN_STATE_NONE # 清除状态
-        
-        text = "👮 **管理员控制台**"
-        keyboard = [
-            [InlineKeyboardButton("🔧 项目开关控制", callback_data="admin_ctrl_plugins")],
-            [InlineKeyboardButton("🌍 代理池管理", callback_data="admin_ctrl_proxies")],
-            [InlineKeyboardButton("👥 用户授权管理", callback_data="admin_ctrl_users")],
-            [InlineKeyboardButton("🔙 返回主菜单", callback_data="main_menu_root")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    # 2. 项目开关控制
-    if data == "admin_ctrl_plugins":
-        if str(user.id) != str(ADMIN_ID): return
-        y_status = user_manager.get_plugin_status("yanci")
-        f_status = user_manager.get_plugin_status("flexiroam")
-        j_status = user_manager.get_plugin_status("jetfi") # <--- 新增状态
-        
-        text = "🔧 **项目运行状态控制**\n点击按钮切换 开启/关闭 状态。"
-        keyboard = [
-            [InlineKeyboardButton(f"Yanci: {'🟢 开启' if y_status else '🔴 关闭'}", callback_data="admin_toggle_yanci")],
-            [InlineKeyboardButton(f"Flexiroam: {'🟢 开启' if f_status else '🔴 关闭'}", callback_data="admin_toggle_flexi")],
-            [InlineKeyboardButton(f"JetFi: {'🟢 开启' if j_status else '🔴 关闭'}", callback_data="admin_toggle_jetfi")], # <--- 新增控制
-            [InlineKeyboardButton("🔙 返回上级", callback_data="admin_menu_main")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    # === 插件开关逻辑 ===
-    if data == "admin_toggle_yanci":
-        user_manager.toggle_plugin("yanci")
-        update.callback_query.data = "admin_ctrl_plugins"
-        await main_callback(update, context)
-        return
-
-    if data == "admin_toggle_flexi":
-        user_manager.toggle_plugin("flexiroam")
-        update.callback_query.data = "admin_ctrl_plugins"
-        await main_callback(update, context)
-        return
-
-    if data == "admin_toggle_jetfi": # <--- 新增切换逻辑
-        user_manager.toggle_plugin("jetfi")
-        update.callback_query.data = "admin_ctrl_plugins"
-        await main_callback(update, context)
-        return
-
-    # 3. 代理池管理 (保持不变)
-    if data == "admin_ctrl_proxies":
-        if str(user.id) != str(ADMIN_ID): return
-        
-        proxy_list = user_manager.get_proxies()
-        use_proxy = user_manager.get_config("use_proxy", True)
+    if data == "user_profile":
+        u_data = user_manager.get_user(user.id)
+        bot_info = await context.bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start={user.id}"
         
         text = (
-            f"🌍 **代理池管理**\n\n"
-            f"当前状态: {'🟢 已开启' if use_proxy else '🔴 已关闭'}\n"
-            f"代理数量: {len(proxy_list)} 个\n\n"
-            f"支持格式:\n1. `ip:port:user:pass` (SOCKS5)\n2. `ip:port` (HTTP)\n"
+            f"👤 **个人中心**\n\n"
+            f"💰 积分: `{u_data['points']}`\n"
+            f"📅 加入: {u_data['join_date']}\n"
+            f"👥 邀请: {u_data['invite_count']} 人\n\n"
+            f"🔗 **专属邀请链接**:\n`{link}`\n"
+            f"(邀请一人得 {user_manager.get_config('invite_reward')} 积分)"
         )
-        keyboard = [
-            [InlineKeyboardButton(f"开关: {'点击关闭' if use_proxy else '点击开启'}", callback_data="admin_proxy_toggle")],
-            [InlineKeyboardButton("📥 批量导入代理", callback_data="admin_proxy_import")],
-            [InlineKeyboardButton("🗑 清空代理池", callback_data="admin_proxy_clear")],
-            [InlineKeyboardButton("🔙 返回上级", callback_data="admin_menu_main")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        invitees = user_manager.get_invite_tree(user.id)
+        if invitees: text += "\n\n📜 **最近邀请:**\n" + "\n".join(invitees)
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]]), parse_mode=ParseMode.MARKDOWN)
         return
 
-    if data == "admin_proxy_toggle":
-        current = user_manager.get_config("use_proxy", True)
-        user_manager.set_config("use_proxy", not current)
-        update.callback_query.data = "admin_ctrl_proxies"
-        await main_callback(update, context)
+    if data == "user_feedback":
+        context.user_data['state'] = FEEDBACK_STATE
+        await query.edit_message_text("🐛 **请回复您遇到的问题：**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu_root")]]), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # 插件入口不做拦截，具体扣费在插件内部的 start_task 处执行
+    pass
+
+# ================= 管理员后台 =================
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    if str(user.id) != str(ADMIN_ID): return
+    data = query.data
+    await query.answer()
+
+    if data == "admin_menu_main":
+        context.user_data['state'] = ADMIN_STATE_NONE
+        text = "👮 **管理员控制台**"
+        kb = [
+            [InlineKeyboardButton("📢 广播消息", callback_data="admin_broadcast"),
+             InlineKeyboardButton("📺 频道设置", callback_data="admin_set_channel")],
+            [InlineKeyboardButton("👥 用户管理", callback_data="admin_user_manage"),
+             InlineKeyboardButton("🌍 代理管理", callback_data="admin_ctrl_proxies")],
+            [InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "admin_broadcast":
+        context.user_data['state'] = ADMIN_WAIT_BROADCAST_MSG
+        await query.edit_message_text("📢 **请回复广播内容**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_menu_main")]]), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "admin_set_channel":
+        curr = user_manager.get_config("required_channel", "未设置")
+        context.user_data['state'] = ADMIN_WAIT_CHANNEL_SET
+        await query.edit_message_text(f"📺 **当前频道**: `{curr}`\n请回复新 ID 或 @username (回复 clear 清除)。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]], parse_mode=ParseMode.MARKDOWN))
+        return
+
+    if data == "admin_user_manage":
+        context.user_data['state'] = ADMIN_WAIT_BAN_ID
+        await query.edit_message_text("🚫 **请回复要 封禁/解封 的用户ID**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]], parse_mode=ParseMode.MARKDOWN))
+        return
+
+    # 代理相关
+    if data == "admin_ctrl_proxies":
+        proxies = user_manager.get_proxies()
+        await query.edit_message_text(f"🌍 代理数: {len(proxies)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 导入", callback_data="admin_proxy_import"), InlineKeyboardButton("🗑 清空", callback_data="admin_proxy_clear"), InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]]))
+        return
+        
+    if data == "admin_proxy_import":
+        context.user_data['state'] = ADMIN_WAIT_PROXY_LIST
+        await query.edit_message_text("请回复代理列表，每行一个", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_menu_main")]]))
         return
 
     if data == "admin_proxy_clear":
         user_manager.clear_proxies()
-        await query.answer("代理池已清空", show_alert=True)
-        update.callback_query.data = "admin_ctrl_proxies"
-        await main_callback(update, context)
-        return
+        await query.answer("已清空", show_alert=True)
+        await admin_callback(update, context)
 
-    if data == "admin_proxy_import":
-        context.user_data['admin_state'] = ADMIN_WAIT_PROXY_LIST
-        text = (
-            "📥 **请直接回复代理列表**\n\n"
-            "每行一个，支持两种格式混用。\n"
-            "例如：\n"
-            "`1.1.1.1:8080:user:pass`\n"
-            "`2.2.2.2:9090`"
-        )
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_ctrl_proxies")]]), parse_mode='Markdown')
-        return
+# ================= 文本处理 =================
 
-    # 4. 用户管理 (保持不变)
-    if data == "admin_ctrl_users":
-        if str(user.id) != str(ADMIN_ID): return
-        users = user_manager.get_all_users()
-        text = "👥 **用户列表 (点击按钮移除授权)**\n"
-        keyboard = []
-        for uid, info in users.items():
-            if str(uid) == str(ADMIN_ID): continue 
-            if not info.get('authorized'): continue
-            name = info.get('name', 'Unknown')
-            count = info.get('count', 0)
-            btn_text = f"❌ 移除 {name[:6]}.. (次数:{count})"
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"admin_revoke_{uid}")])
-        if not keyboard: text += "\n暂无其他授权用户。"
-        keyboard.append([InlineKeyboardButton("🔙 返回上级", callback_data="admin_menu_main")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    if data.startswith("admin_revoke_"):
-        target_uid = data.split("_")[-1]
-        user_manager.revoke_user(target_uid)
-        await query.answer(f"已移除用户 {target_uid} 的权限", show_alert=True)
-        update.callback_query.data = "admin_ctrl_users"
-        await main_callback(update, context)
-        return
-
-async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理管理员的文本输入 (如导入代理)"""
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if str(user.id) != str(ADMIN_ID): return # 仅限管理员
+    text = update.message.text
+    state = context.user_data.get('state', 0)
 
-    state = context.user_data.get('admin_state', ADMIN_STATE_NONE)
-    
-    if state == ADMIN_WAIT_PROXY_LIST:
-        text = update.message.text
-        lines = text.strip().split('\n')
-        new_proxies = []
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-            # 简单校验格式
-            parts = line.split(':')
-            if len(parts) in [2, 4]:
-                new_proxies.append(line)
-        
-        if new_proxies:
-            user_manager.add_proxies(new_proxies)
-            msg = f"✅ 成功导入 {len(new_proxies)} 个代理！"
+    if state == FEEDBACK_STATE:
+        if ADMIN_ID:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"📩 **反馈**\n用户: {user.full_name} ({user.id})\n内容: {text}")
+            await update.message.reply_text("✅ 反馈已提交。")
         else:
-            msg = "⚠️ 未识别到有效代理格式。"
-            
-        context.user_data['admin_state'] = ADMIN_STATE_NONE
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回代理管理", callback_data="admin_ctrl_proxies")]]))
+            await update.message.reply_text("未设置管理员。")
+        context.user_data['state'] = 0
         return
 
-async def post_init(application):
-    await application.bot.set_my_commands([BotCommand("start", "打开主菜单")])
+    if str(user.id) == str(ADMIN_ID):
+        if state == ADMIN_WAIT_BROADCAST_MSG:
+            ids = user_manager.get_all_users()
+            sent = 0
+            await update.message.reply_text(f"⏳ 正在广播给 {len(ids)} 人...")
+            for uid in ids:
+                try:
+                    await context.bot.copy_message(chat_id=uid, from_chat_id=user.id, message_id=update.message.message_id)
+                    sent += 1
+                    await asyncio.sleep(0.05)
+                except: pass
+            await update.message.reply_text(f"✅ 成功发送: {sent}")
+            context.user_data['state'] = ADMIN_STATE_NONE
+            return
 
-# ================= 启动逻辑 =================
+        if state == ADMIN_WAIT_CHANNEL_SET:
+            val = "" if text == "clear" else text
+            user_manager.set_config("required_channel", val)
+            await update.message.reply_text(f"✅ 频道设置: {val}")
+            context.user_data['state'] = ADMIN_STATE_NONE
+            return
+
+        if state == ADMIN_WAIT_BAN_ID:
+            uid = text.strip()
+            new_stat = not user_manager.is_banned(uid)
+            user_manager.set_ban(uid, new_stat)
+            await update.message.reply_text(f"用户 {uid} 封禁状态: {new_stat}")
+            context.user_data['state'] = ADMIN_STATE_NONE
+            return
+
+        if state == ADMIN_WAIT_PROXY_LIST:
+            proxies = text.strip().split('\n')
+            user_manager.add_proxies(proxies)
+            await update.message.reply_text(f"✅ 添加 {len(proxies)} 个代理")
+            context.user_data['state'] = ADMIN_STATE_NONE
+            return
+
+async def post_init(app):
+    await app.bot.set_my_commands([BotCommand("start", "主菜单"), BotCommand("feedback", "反馈")])
 
 def main():
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     
-    # 1. 注册主程序
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(main_callback, pattern="^main_menu_root$|^global_.*|^admin_.*"))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("feedback", lambda u,c: user_callback(u,c) or u.callback_query.data=="user_feedback"))
     
-    # 2. 注册管理员文本处理器 (优先级最高 group=0)
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), admin_text_handler), group=0)
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_.*"))
+    app.add_handler(CallbackQueryHandler(user_callback, pattern="^user_.*|^main_menu_root$|^plugin_.*"))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
     
-    # 3. 加载插件
-    yanci.register_handlers(application)
-    flexiroam.register_handlers(application)
-    jetfi.register_handlers(application) # <--- 注册新插件
-    travelgoogoo.register_handlers(application)
-
-    # === 启动状态打印 ===
-    use_proxy = user_manager.get_config("use_proxy", True)
-    proxies = user_manager.get_proxies()
+    # 注册插件
+    yanci.register_handlers(app)
+    flexiroam.register_handlers(app)
+    jetfi.register_handlers(app)
+    travelgoogoo.register_handlers(app)
     
-    print("\n" + "="*30)
-    logger.info(f"代理系统状态: {'🟢 开启' if use_proxy else '🔴 关闭'}")
-    logger.info(f"当前代理数量: {len(proxies)}")
-    print("="*30 + "\n")
-    
-    print("✅ 机器人已启动 (Yanci + Flexiroam + JetFi)...")
-    application.run_polling()
+    print("✅ Bot Started with MySQL...")
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
-
-
-
