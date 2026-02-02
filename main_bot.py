@@ -4,18 +4,13 @@ import logging
 import asyncio
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 
-# 导入工具
-from utils.database import user_manager, ADMIN_ID
+# 导入数据库
+from utils.database import db, ADMIN_ID
 
 # 导入插件
-from plugins import yanci
-from plugins import flexiroam
-from plugins import jetfi
-from plugins import travelgoogoo
+from plugins import yanci, flexiroam, jetfi, travelgoogoo
 
 # 配置日志
 logging.basicConfig(
@@ -28,146 +23,138 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 
 if not BOT_TOKEN:
-    print("❌ 错误：未找到 TG_BOT_TOKEN")
-    sys.exit(1)
+    sys.exit("❌ 错误：未找到 TG_BOT_TOKEN")
 
-# 定义管理状态
-ADMIN_STATE_NONE = 0
-ADMIN_WAIT_PROXY_LIST = 101
-ADMIN_WAIT_BROADCAST_MSG = 102
-ADMIN_WAIT_CHANNEL_SET = 103
-ADMIN_WAIT_BAN_ID = 104
-FEEDBACK_STATE = 200
+# 定义状态
+FEEDBACK_STATE = 1
+ADMIN_PUSH_STATE = 2
 
 # ================= 辅助函数 =================
 
-async def check_channel_join(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def check_channel_join(user_id, context):
     """检查用户是否加入了指定频道"""
-    channel = user_manager.get_config("required_channel")
-    if not channel or str(user_id) == str(ADMIN_ID):
-        return True, ""
+    channel_id = db.get_config("force_join_channel", "")
+    if not channel_id:
+        return True # 未设置则跳过
     
     try:
-        member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+        member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
         if member.status in ['left', 'kicked']:
-            return False, channel
-        return True, ""
-    except BadRequest:
-        # 机器人不在频道里，或者频道不存在，默认跳过
-        return True, ""
+            return False
+        return True
     except Exception as e:
-        logger.error(f"Channel check error: {e}")
-        return True, ""
+        logger.error(f"Check channel error: {e}")
+        return True # 异常情况默认放行，避免配置错误导致无法使用
 
-def get_main_keyboard(is_admin):
-    kb = [
-        [InlineKeyboardButton("📅 每日签到", callback_data="user_daily_checkin"),
-         InlineKeyboardButton("👤 个人中心", callback_data="user_profile")],
-        [InlineKeyboardButton("🌏 Yanci", callback_data="plugin_yanci_entry"),
-         InlineKeyboardButton("🌐 Flexiroam", callback_data="plugin_flexi_entry")],
-        [InlineKeyboardButton("🚙 JetFi", callback_data="plugin_jetfi_entry"),
-         InlineKeyboardButton("🏝 TravelGoo", callback_data="plugin_travel_entry")],
-        [InlineKeyboardButton("🐛 问题反馈", callback_data="user_feedback")]
-    ]
-    if is_admin:
-        kb.append([InlineKeyboardButton("👮 管理员后台", callback_data="admin_menu_main")])
-    return InlineKeyboardMarkup(kb)
-
-# ================= 核心命令 =================
+# ================= 主菜单逻辑 =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
     
-    # 1. 更新数据库信息
-    user_manager.update_user_info(user.id, user.full_name, user.username)
+    # 1. 邀请处理与用户创建
+    inviter_id = None
+    if args and args[0].isdigit():
+        inviter_id = int(args[0])
     
-    # 2. 封禁检查
-    if user_manager.is_banned(user.id):
+    # 获取或创建用户 (数据库操作)
+    db_user = db.get_or_create_user(user.id, user.username, user.first_name, inviter_id)
+    
+    if db_user.is_banned:
         await update.message.reply_text("🚫 您的账号已被封禁。")
         return
 
-    # 3. 处理邀请
-    if args and len(args) > 0:
-        inviter_id = args[0]
-        if not user.username:
-            await update.message.reply_text("⚠️ **提示**：您需要设置 Telegram 用户名 (Username) 才能接受邀请奖励。", parse_mode=ParseMode.MARKDOWN)
-        else:
-            if user_manager.set_inviter(user.id, inviter_id):
-                reward = user_manager.get_config("invite_reward")
-                try:
-                    await context.bot.send_message(chat_id=inviter_id, text=f"🎉 新用户 {user.full_name} 加入！\n💰 获得积分: +{reward}")
-                except: pass
-
-    # 4. 强制关注检查
-    is_joined, channel_name = await check_channel_join(user.id, context)
-    if not is_joined:
-        clean_name = channel_name.replace('@', '')
-        kb = [[InlineKeyboardButton("👉 加入频道", url=f"https://t.me/{clean_name}")],
-              [InlineKeyboardButton("✅ 我已加入", callback_data="main_menu_root")]]
-        await update.message.reply_text(f"🛑 **需关注频道才能使用**\n请先加入: {channel_name}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-        return
-
     text = (
-        f"👋 **你好，{user.first_name}！**\n\n"
-        f"💰 积分: `{user_manager.get_points(user.id)}`\n"
-        f"🆔 ID: `{user.id}`\n\n"
-        f"请选择功能："
+        f"🤖 **聚合控制中心 v2.0**\n\n"
+        f"你好，{user.first_name}！\n"
+        f"ID: `{user.id}`\n"
+        f"💰 积分: **{db_user.balance}**\n\n"
+        f"🔗 **您的邀请链接**:\n"
+        f"`https://t.me/{context.bot.username}?start={user.id}`\n"
+        f"(邀请有用户名的新用户可获奖励)\n"
     )
-    await update.message.reply_text(text, reply_markup=get_main_keyboard(str(user.id) == str(ADMIN_ID)), parse_mode=ParseMode.MARKDOWN)
 
-# ================= 用户回调 =================
+    keyboard = [
+        [InlineKeyboardButton("📅 每日签到", callback_data="feature_checkin"), 
+         InlineKeyboardButton("📝 提交反馈", callback_data="feature_feedback")],
+        [InlineKeyboardButton("🌏 Yanci", callback_data="plugin_yanci_entry"),
+         InlineKeyboardButton("🌐 Flexiroam", callback_data="plugin_flexi_entry")],
+        [InlineKeyboardButton("🚙 JetFi", callback_data="plugin_jetfi_entry"),
+         InlineKeyboardButton("🏝 TravelGooGoo", callback_data="plugin_travel_entry")],
+        [InlineKeyboardButton("👥 我的邀请", callback_data="feature_my_invites")]
+    ]
 
-async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(user.id) == str(ADMIN_ID):
+         keyboard.append([InlineKeyboardButton("👮 管理员后台", callback_data="admin_menu_main")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# ================= 通用功能回调 =================
+
+async def feature_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
-    data = query.data
     await query.answer()
+    data = query.data
 
-    if user_manager.is_banned(user.id):
-        await query.edit_message_text("🚫 账号已封禁。")
-        return
-
-    if data == "main_menu_root":
-        text = f"👋 **你好，{user.first_name}！**\n\n💰 积分: `{user_manager.get_points(user.id)}`\n🆔 ID: `{user.id}`"
-        await query.edit_message_text(text, reply_markup=get_main_keyboard(str(user.id) == str(ADMIN_ID)), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if data == "user_daily_checkin":
-        success, reward = user_manager.check_in(user.id)
-        if success:
-            text = f"✅ **签到成功！**\n积分 +{reward}\n当前余额: {user_manager.get_points(user.id)}"
-        else:
-            text = f"⚠️ **今天已签到**\n明天再来吧！"
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]]), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if data == "user_profile":
-        u_data = user_manager.get_user(user.id)
-        bot_info = await context.bot.get_me()
-        link = f"https://t.me/{bot_info.username}?start={user.id}"
-        
-        text = (
-            f"👤 **个人中心**\n\n"
-            f"💰 积分: `{u_data['points']}`\n"
-            f"📅 加入: {u_data['join_date']}\n"
-            f"👥 邀请: {u_data['invite_count']} 人\n\n"
-            f"🔗 **专属邀请链接**:\n`{link}`\n"
-            f"(邀请一人得 {user_manager.get_config('invite_reward')} 积分)"
+    # 1. 强制关注检查
+    if not await check_channel_join(user.id, context):
+        channel_id = db.get_config("force_join_channel")
+        await query.edit_message_text(
+            f"⚠️ **请先加入频道**\n为了使用本机器人，请先加入频道。\n\n加入后重新输入 /start",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入频道", url=f"https://t.me/{channel_id.replace('@','')}")]])
         )
-        invitees = user_manager.get_invite_tree(user.id)
-        if invitees: text += "\n\n📜 **最近邀请:**\n" + "\n".join(invitees)
+        return
+
+    # 2. 每日签到
+    if data == "feature_checkin":
+        success, msg = db.daily_checkin(user.id)
+        await query.edit_message_text(
+            f"📅 **签到结果**\n\n{msg}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]])
+        )
+        return
+
+    # 3. 我的邀请
+    if data == "feature_my_invites":
+        invitees = db.get_invite_list(user.id)
+        text = f"👥 **我的邀请记录**\n\n累计邀请: {len(invitees)} 人\n\n"
+        if not invitees:
+            text += "暂无邀请记录，快去分享链接吧！"
+        else:
+            text += "最近 10 位:\n"
+            for inv in invitees[:10]:
+                name = inv[1] or "无用户名"
+                text += f"- `{inv[0]}` ({name})\n"
         
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]]), parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]], parse_mode='Markdown'))
         return
 
-    if data == "user_feedback":
-        context.user_data['state'] = FEEDBACK_STATE
-        await query.edit_message_text("🐛 **请回复您遇到的问题：**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="main_menu_root")]]), parse_mode=ParseMode.MARKDOWN)
-        return
+    # 4. 反馈入口
+    if data == "feature_feedback":
+        await query.edit_message_text("📝 **请输入您的反馈内容：**\n(请直接回复消息，输入 /cancel 取消)")
+        return str(FEEDBACK_STATE) # 返回状态给 ConversationHandler
 
-    # 插件入口不做拦截，具体扣费在插件内部的 start_task 处执行
-    pass
+# ================= 反馈处理 =================
+
+async def feedback_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = update.message.text
+    user = update.effective_user
+    db.add_feedback(user.id, content)
+    await update.message.reply_text(
+        "✅ **反馈已提交**\n管理员会尽快处理。",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回主菜单", callback_data="main_menu_root")]], parse_mode='Markdown')
+    )
+    return ConversationHandler.END
+
+async def cancel_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("已取消。")
+    return ConversationHandler.END
 
 # ================= 管理员后台 =================
 
@@ -175,128 +162,137 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
     if str(user.id) != str(ADMIN_ID): return
-    data = query.data
     await query.answer()
+    data = query.data
 
     if data == "admin_menu_main":
-        context.user_data['state'] = ADMIN_STATE_NONE
         text = "👮 **管理员控制台**"
         kb = [
-            [InlineKeyboardButton("📢 广播消息", callback_data="admin_broadcast"),
-             InlineKeyboardButton("📺 频道设置", callback_data="admin_set_channel")],
-            [InlineKeyboardButton("👥 用户管理", callback_data="admin_user_manage"),
-             InlineKeyboardButton("🌍 代理管理", callback_data="admin_ctrl_proxies")],
+            [InlineKeyboardButton("📢 全员推送", callback_data="admin_push_msg")],
+            [InlineKeyboardButton("🔨 用户管理 (封禁/充值)", callback_data="admin_user_mgmt")],
+            [InlineKeyboardButton("⚙️ 参数设置", callback_data="admin_settings")],
             [InlineKeyboardButton("🔙 返回", callback_data="main_menu_root")]
         ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
         return
 
-    if data == "admin_broadcast":
-        context.user_data['state'] = ADMIN_WAIT_BROADCAST_MSG
-        await query.edit_message_text("📢 **请回复广播内容**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_menu_main")]]), parse_mode=ParseMode.MARKDOWN)
-        return
+    if data == "admin_push_msg":
+        await query.edit_message_text("📢 **请输入要推送的消息内容：**\n(支持 Markdown，输入 /cancel 取消)")
+        return str(ADMIN_PUSH_STATE)
 
-    if data == "admin_set_channel":
-        curr = user_manager.get_config("required_channel", "未设置")
-        context.user_data['state'] = ADMIN_WAIT_CHANNEL_SET
-        await query.edit_message_text(f"📺 **当前频道**: `{curr}`\n请回复新 ID 或 @username (回复 clear 清除)。", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]], parse_mode=ParseMode.MARKDOWN))
-        return
-
-    if data == "admin_user_manage":
-        context.user_data['state'] = ADMIN_WAIT_BAN_ID
-        await query.edit_message_text("🚫 **请回复要 封禁/解封 的用户ID**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]], parse_mode=ParseMode.MARKDOWN))
-        return
-
-    # 代理相关
-    if data == "admin_ctrl_proxies":
-        proxies = user_manager.get_proxies()
-        await query.edit_message_text(f"🌍 代理数: {len(proxies)}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 导入", callback_data="admin_proxy_import"), InlineKeyboardButton("🗑 清空", callback_data="admin_proxy_clear"), InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]]))
+    if data == "admin_settings":
+        # 显示当前配置
+        cfg_inv = db.get_config("invite_reward")
+        cfg_chk = db.get_config("checkin_reward")
+        cfg_y = db.get_config("cost_yanci")
+        text = (
+            f"⚙️ **系统参数**\n\n"
+            f"邀请奖励: {cfg_inv}\n"
+            f"签到奖励: {cfg_chk}\n"
+            f"Yanci消耗: {cfg_y}\n\n"
+            f"⚠️ 修改请直接修改数据库 `settings` 表或后续开发指令设置。"
+        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]]))
         return
         
-    if data == "admin_proxy_import":
-        context.user_data['state'] = ADMIN_WAIT_PROXY_LIST
-        await query.edit_message_text("请回复代理列表，每行一个", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 取消", callback_data="admin_menu_main")]]))
+    # 用户管理子菜单 (简化版，实际可通过命令 /ban uid 实现)
+    if data == "admin_user_mgmt":
+        text = "🔨 请使用命令操作：\n\n`/ban 123456` - 封禁用户\n`/unban 123456` - 解封用户\n`/add 123456 100` - 充值积分"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 返回", callback_data="admin_menu_main")]]), parse_mode='Markdown')
         return
 
-    if data == "admin_proxy_clear":
-        user_manager.clear_proxies()
-        await query.answer("已清空", show_alert=True)
-        await admin_callback(update, context)
+# === 管理员命令处理 ===
 
-# ================= 文本处理 =================
+async def admin_cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_ID): return
+    try:
+        target_id = int(context.args[0])
+        db.set_ban(target_id, True)
+        await update.message.reply_text(f"✅ 用户 {target_id} 已封禁。")
+    except: await update.message.reply_text("用法: /ban <uid>")
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text
-    state = context.user_data.get('state', 0)
+async def admin_cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_ID): return
+    try:
+        target_id = int(context.args[0])
+        db.set_ban(target_id, False)
+        await update.message.reply_text(f"✅ 用户 {target_id} 已解封。")
+    except: await update.message.reply_text("用法: /unban <uid>")
 
-    if state == FEEDBACK_STATE:
-        if ADMIN_ID:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=f"📩 **反馈**\n用户: {user.full_name} ({user.id})\n内容: {text}")
-            await update.message.reply_text("✅ 反馈已提交。")
-        else:
-            await update.message.reply_text("未设置管理员。")
-        context.user_data['state'] = 0
-        return
+async def admin_cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != str(ADMIN_ID): return
+    try:
+        target_id = int(context.args[0])
+        amount = int(context.args[1])
+        db.admin_add_points(target_id, amount)
+        await update.message.reply_text(f"✅ 已给 {target_id} 增加 {amount} 积分。")
+    except: await update.message.reply_text("用法: /add <uid> <amount>")
 
-    if str(user.id) == str(ADMIN_ID):
-        if state == ADMIN_WAIT_BROADCAST_MSG:
-            ids = user_manager.get_all_users()
-            sent = 0
-            await update.message.reply_text(f"⏳ 正在广播给 {len(ids)} 人...")
-            for uid in ids:
-                try:
-                    await context.bot.copy_message(chat_id=uid, from_chat_id=user.id, message_id=update.message.message_id)
-                    sent += 1
-                    await asyncio.sleep(0.05)
-                except: pass
-            await update.message.reply_text(f"✅ 成功发送: {sent}")
-            context.user_data['state'] = ADMIN_STATE_NONE
-            return
+async def admin_push_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message.text
+    user_ids = db.get_all_user_ids()
+    count = 0
+    status_msg = await update.message.reply_text(f"🚀 开始向 {len(user_ids)} 人推送...")
+    
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(uid, f"📢 **系统通知**\n\n{msg}", parse_mode='Markdown')
+            count += 1
+        except Exception:
+            pass # 用户可能已封锁机器人
+        if count % 20 == 0:
+            await asyncio.sleep(1) # 限流
+            
+    await status_msg.edit_text(f"✅ 推送完成，成功发送: {count} 人。")
+    return ConversationHandler.END
 
-        if state == ADMIN_WAIT_CHANNEL_SET:
-            val = "" if text == "clear" else text
-            user_manager.set_config("required_channel", val)
-            await update.message.reply_text(f"✅ 频道设置: {val}")
-            context.user_data['state'] = ADMIN_STATE_NONE
-            return
+# ================= 启动逻辑 =================
 
-        if state == ADMIN_WAIT_BAN_ID:
-            uid = text.strip()
-            new_stat = not user_manager.is_banned(uid)
-            user_manager.set_ban(uid, new_stat)
-            await update.message.reply_text(f"用户 {uid} 封禁状态: {new_stat}")
-            context.user_data['state'] = ADMIN_STATE_NONE
-            return
-
-        if state == ADMIN_WAIT_PROXY_LIST:
-            proxies = text.strip().split('\n')
-            user_manager.add_proxies(proxies)
-            await update.message.reply_text(f"✅ 添加 {len(proxies)} 个代理")
-            context.user_data['state'] = ADMIN_STATE_NONE
-            return
-
-async def post_init(app):
-    await app.bot.set_my_commands([BotCommand("start", "主菜单"), BotCommand("feedback", "反馈")])
+async def post_init(application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "主菜单"),
+        BotCommand("ban", "封禁 (Admin)"),
+        BotCommand("add", "充值 (Admin)"),
+    ])
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("feedback", lambda u,c: user_callback(u,c) or u.callback_query.data=="user_feedback"))
+    # 1. 对话处理器 (反馈 & 推送)
+    fb_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(feature_callback, pattern="^feature_feedback$")],
+        states={str(FEEDBACK_STATE): [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handle)]},
+        fallbacks=[CommandHandler("cancel", cancel_feedback)]
+    )
     
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_.*"))
-    app.add_handler(CallbackQueryHandler(user_callback, pattern="^user_.*|^main_menu_root$|^plugin_.*"))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
+    push_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_callback, pattern="^admin_push_msg$")],
+        states={str(ADMIN_PUSH_STATE): [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_push_handle)]},
+        fallbacks=[CommandHandler("cancel", cancel_feedback)]
+    )
     
-    # 注册插件
-    yanci.register_handlers(app)
-    flexiroam.register_handlers(app)
-    jetfi.register_handlers(app)
-    travelgoogoo.register_handlers(app)
+    application.add_handler(fb_handler)
+    application.add_handler(push_handler)
+
+    # 2. 基础命令
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("ban", admin_cmd_ban))
+    application.add_handler(CommandHandler("unban", admin_cmd_unban))
+    application.add_handler(CommandHandler("add", admin_cmd_add))
+
+    # 3. 回调处理
+    application.add_handler(CallbackQueryHandler(start, pattern="^main_menu_root$"))
+    application.add_handler(CallbackQueryHandler(feature_callback, pattern="^feature_.*"))
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_.*"))
     
-    print("✅ Bot Started with MySQL...")
-    app.run_polling()
+    # 4. 插件加载
+    yanci.register_handlers(application)
+    flexiroam.register_handlers(application)
+    jetfi.register_handlers(application)
+    travelgoogoo.register_handlers(application)
+
+    print("✅ 机器人 v2.0 (MySQL版) 已启动...")
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
